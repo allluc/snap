@@ -133,6 +133,30 @@ For detailed setup instructions, see **[SETUP.md](SETUP.md)**.
 
 ---
 
+## macOS Quick Install
+
+# 1) Build app
+
+# 2) Install into /Applications
+cp -R ~/<location of snap>/app/src-tauri/target/release/bundle/macos/snap.app /Applications/
+
+# 3) Launch
+open -a /Applications/snap.app
+```
+
+First run:
+- Press `Ctrl+Shift+S` once to trigger permission prompts.
+- Allow Screen Recording/Automation/Accessibility if asked.
+
+If permissions get stuck:
+
+```bash
+tccutil reset All com.adjective.snap
+open -a /Applications/snap.app
+```
+
+---
+
 ## Example Workflow
 
 You're vibe engineering a web app. You open it in the browser, scroll through, and spot three issues.

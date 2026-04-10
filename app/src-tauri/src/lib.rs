@@ -4,72 +4,134 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 pub static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static PRE_CAPTURED: AtomicBool = AtomicBool::new(false);
 
 // ----- Screen Capture -----
+
+#[cfg(target_os = "macos")]
+pub fn capture_screen_interactive() -> Result<(), String> {
+    let path = "/tmp/snap-capture.png";
+    let _ = fs::remove_file(path);
+
+    let output = Command::new("screencapture")
+        .args(["-i", "-s", path])
+        .output()
+        .map_err(|e| format!("screencapture failed to launch: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "screencapture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    match fs::metadata(path) {
+        Ok(meta) if meta.len() > 0 => {
+            log_event("region captured interactively");
+            PRE_CAPTURED.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        _ => Err("cancelled".to_string()),
+    }
+}
 
 #[tauri::command]
 fn capture_screen() -> Result<String, String> {
     let path = "/tmp/snap-capture.png";
 
-    // Clean up previous capture
-    let _ = fs::remove_file(path);
+    #[cfg(target_os = "macos")]
+    {
+        if PRE_CAPTURED.swap(false, Ordering::SeqCst) {
+            return Ok(path.to_string());
+        }
 
-    // Try capture methods in order of preference
-    let methods: Vec<(&str, Vec<&str>)> = if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        vec![
-            // GNOME Wayland: gnome-screenshot is the most reliable
-            ("gnome-screenshot", vec!["--file", path]),
-            // wlroots-based compositors (Sway, Hyprland, etc.)
-            ("grim", vec![path]),
-            // Fallback: scrot might work via XWayland
-            ("scrot", vec!["--overwrite", path]),
-        ]
-    } else {
-        vec![
-            ("scrot", vec!["--overwrite", path]),
-            ("gnome-screenshot", vec!["--file", path]),
-        ]
-    };
+        // fallback: full-screen silent capture
+        let _ = fs::remove_file(path);
+        let output = Command::new("screencapture")
+            .args(["-x", path])
+            .output()
+            .map_err(|e| format!("screencapture failed to launch: {}", e))?;
 
-    let mut last_error = String::from("No screenshot tool found");
+        if !output.status.success() {
+            return Err(format!(
+                "screencapture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
 
-    for (tool, args) in &methods {
-        match Command::new(tool).args(args).output() {
-            Ok(output) if output.status.success() => {
-                match fs::metadata(path) {
-                    Ok(meta) if meta.len() > 0 => {
-                        log_event(&format!("screen captured via {}", tool));
-                        return Ok(path.to_string());
-                    }
-                    _ => {
-                        last_error = format!("{} produced empty file", tool);
-                        continue;
-                    }
-                }
+        match fs::metadata(path) {
+            Ok(meta) if meta.len() > 0 => {
+                log_event("screen captured via screencapture");
+                return Ok(path.to_string());
             }
-            Ok(output) => {
-                last_error = format!(
-                    "{} failed: {}",
-                    tool,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                continue;
-            }
-            Err(_) => continue, // tool not installed, try next
+            _ => return Err("screencapture produced empty file".to_string()),
         }
     }
 
-    Err(format!(
-        "Screen capture failed: {}. Install one of: sudo apt install gnome-screenshot grim scrot",
-        last_error
-    ))
+    #[cfg(not(target_os = "macos"))]
+    // Clean up previous capture
+    let _ = fs::remove_file(path);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux: try capture tools in order of preference
+        let methods: Vec<(&str, Vec<&str>)> = if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            vec![
+                // GNOME Wayland: gnome-screenshot is the most reliable
+                ("gnome-screenshot", vec!["--file", path]),
+                // wlroots-based compositors (Sway, Hyprland, etc.)
+                ("grim", vec![path]),
+                // Fallback: scrot might work via XWayland
+                ("scrot", vec!["--overwrite", path]),
+            ]
+        } else {
+            vec![
+                ("scrot", vec!["--overwrite", path]),
+                ("gnome-screenshot", vec!["--file", path]),
+            ]
+        };
+
+        let mut last_error = String::from("No screenshot tool found");
+
+        for (tool, args) in &methods {
+            match Command::new(tool).args(args).output() {
+                Ok(output) if output.status.success() => {
+                    match fs::metadata(path) {
+                        Ok(meta) if meta.len() > 0 => {
+                            log_event(&format!("screen captured via {}", tool));
+                            return Ok(path.to_string());
+                        }
+                        _ => {
+                            last_error = format!("{} produced empty file", tool);
+                            continue;
+                        }
+                    }
+                }
+                Ok(output) => {
+                    last_error = format!(
+                        "{} failed: {}",
+                        tool,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    continue;
+                }
+                Err(_) => continue, // tool not installed, try next
+            }
+        }
+
+        Err(format!(
+            "Screen capture failed: {}. Install one of: sudo apt install gnome-screenshot grim scrot",
+            last_error
+        ))
+    }
 }
 
 // ----- Window Context -----
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct WindowContext {
     window_title: Option<String>,
     url: Option<String>,
@@ -77,51 +139,143 @@ struct WindowContext {
     pid: Option<u32>,
 }
 
+static PRE_CAPTURED_CONTEXT: Mutex<Option<WindowContext>> = Mutex::new(None);
+
+pub fn capture_and_store_window_context() {
+    #[cfg(target_os = "macos")]
+    {
+        let ctx = get_active_window_context_macos().unwrap_or(WindowContext {
+            window_title: None, url: None, window_class: None, pid: None,
+        });
+        if let Ok(mut lock) = PRE_CAPTURED_CONTEXT.lock() {
+            *lock = Some(ctx);
+        }
+    }
+}
+
 #[tauri::command]
 fn get_active_window_context() -> Result<WindowContext, String> {
-    // Only works on X11
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        return Ok(WindowContext {
-            window_title: None,
-            url: None,
-            window_class: None,
-            pid: None,
-        });
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut lock) = PRE_CAPTURED_CONTEXT.lock() {
+            if let Some(ctx) = lock.take() {
+                return Ok(ctx);
+            }
+        }
+        return get_active_window_context_macos();
     }
 
-    let title = run_xdotool(&["getactivewindow", "getwindowname"]);
-    let class = run_xdotool(&["getactivewindow", "getwindowclassname"]);
-    let pid_str = run_xdotool(&["getactivewindow", "getwindowpid"]);
-    let pid = pid_str.as_ref().and_then(|s| s.trim().parse::<u32>().ok());
-
-    // Try to infer URL from browser window titles
-    let url = title.as_ref().and_then(|t| {
-        let is_browser = class
-            .as_ref()
-            .map(|c| {
-                let lower = c.to_lowercase();
-                lower.contains("brave")
-                    || lower.contains("firefox")
-                    || lower.contains("chrom")
-                    || lower.contains("webkit")
-            })
-            .unwrap_or(false);
-
-        if is_browser {
-            Some(t.clone())
-        } else {
-            None
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Only works on X11
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            return Ok(WindowContext {
+                window_title: None,
+                url: None,
+                window_class: None,
+                pid: None,
+            });
         }
+
+        let title = run_xdotool(&["getactivewindow", "getwindowname"]);
+        let class = run_xdotool(&["getactivewindow", "getwindowclassname"]);
+        let pid_str = run_xdotool(&["getactivewindow", "getwindowpid"]);
+        let pid = pid_str.as_ref().and_then(|s| s.trim().parse::<u32>().ok());
+
+        // Try to infer URL from browser window titles
+        let url = title.as_ref().and_then(|t| {
+            let is_browser = class
+                .as_ref()
+                .map(|c| {
+                    let lower = c.to_lowercase();
+                    lower.contains("brave")
+                        || lower.contains("firefox")
+                        || lower.contains("chrom")
+                        || lower.contains("webkit")
+                })
+                .unwrap_or(false);
+
+            if is_browser {
+                Some(t.clone())
+            } else {
+                None
+            }
+        });
+
+        Ok(WindowContext {
+            window_title: title,
+            url,
+            window_class: class,
+            pid,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_active_window_context_macos() -> Result<WindowContext, String> {
+    fn osascript(script: &str) -> Option<String> {
+        Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                }
+            })
+    }
+
+    // Get frontmost application name
+    let app_name = osascript(
+        "tell application \"System Events\" to get name of first process where frontmost is true",
+    );
+
+    // Get frontmost window title
+    let window_title = app_name.as_deref().and_then(|name| {
+        osascript(&format!(
+            "tell application \"{}\" to get name of front window",
+            name
+        ))
     });
 
+    let is_browser = app_name.as_deref().map(|n| {
+        let lower = n.to_lowercase();
+        lower.contains("safari")
+            || lower.contains("firefox")
+            || lower.contains("chrome")
+            || lower.contains("brave")
+            || lower.contains("webkit")
+    }).unwrap_or(false);
+
+    let url = if is_browser {
+        app_name.as_deref().and_then(|name| {
+            let lower = name.to_lowercase();
+            let script = if lower.contains("safari") {
+                "tell application \"Safari\" to get URL of current tab of front window".to_string()
+            } else {
+                format!(
+                    "tell application \"{}\" to get URL of active tab of front window",
+                    name
+                )
+            };
+            osascript(&script)
+        })
+    } else {
+        None
+    };
+
     Ok(WindowContext {
-        window_title: title,
+        window_title: window_title.or_else(|| app_name.clone()),
         url,
-        window_class: class,
-        pid,
+        window_class: app_name,
+        pid: None,
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn run_xdotool(args: &[&str]) -> Option<String> {
     Command::new("xdotool")
         .args(args)

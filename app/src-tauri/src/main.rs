@@ -1,15 +1,56 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::env;
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+};
+
+struct SingleInstanceGuard {
+    path: PathBuf,
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn try_acquire_single_instance() -> Result<SingleInstanceGuard, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let snap_dir = home.join(".snap");
+    fs::create_dir_all(&snap_dir).map_err(|e| format!("Failed to create ~/.snap: {}", e))?;
+
+    let lock_path = snap_dir.join("snap-tray.lock");
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err("another instance is already running".to_string());
+        }
+        Err(e) => return Err(format!("failed to create lock file: {}", e)),
+    };
+
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(SingleInstanceGuard { path: lock_path })
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let is_wayland = env::var("WAYLAND_DISPLAY").is_ok();
 
-    // On Wayland or with --overlay flag: single-shot overlay mode
-    // On X11 without flags: tray app with global hotkey
-    if is_wayland || args.contains(&"--overlay-mode".to_string()) {
+    #[cfg(target_os = "macos")]
+    let use_overlay = args.contains(&"--overlay-mode".to_string());
+
+    #[cfg(not(target_os = "macos"))]
+    let use_overlay = env::var("WAYLAND_DISPLAY").is_ok()
+        || args.contains(&"--overlay-mode".to_string());
+
+    if use_overlay {
         run_overlay_mode();
     } else {
         run_tray_mode();
@@ -24,7 +65,7 @@ fn run_overlay_mode() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(snap_lib::invoke_handler())
-        .setup(|app| {
+        .setup(|_app| {
             snap_lib::log_event("overlay mode ready");
             Ok(())
         })
@@ -32,29 +73,44 @@ fn run_overlay_mode() {
         .expect("error while running snap");
 }
 
-/// Tray mode: background app with global hotkey (X11 only).
 fn run_tray_mode() {
     use std::sync::atomic::Ordering;
     use tauri::{
         image::Image,
         menu::{Menu, MenuItem},
         tray::TrayIconBuilder,
+        Emitter,
         Manager,
     };
     use tauri_plugin_global_shortcut::{
         Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
     };
 
-    snap_lib::log_event("snap starting (tray mode, X11)");
+    let _instance_guard = match try_acquire_single_instance() {
+        Ok(guard) => guard,
+        Err(e) => {
+            snap_lib::log_event(&format!("tray start skipped: {}", e));
+            return;
+        }
+    };
+
+    snap_lib::log_event("snap starting (tray mode)");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(snap_lib::invoke_handler())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
             // ---- System tray ----
+            let open_logs =
+                MenuItem::with_id(app, "open_logs", "Open Logs", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Snap", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
+            let menu = Menu::with_items(app, &[&open_logs, &quit])?;
 
             let icon = {
                 let png_bytes = include_bytes!("../icons/icon.png");
@@ -73,11 +129,29 @@ fn run_tray_mode() {
                 }
             };
 
+            let (shortcut_mods, shortcut_label) = (Modifiers::CONTROL | Modifiers::SHIFT, "Ctrl+Shift+S");
+
             TrayIconBuilder::new()
                 .icon(icon)
-                .tooltip("Snap — Ctrl+Shift+S to annotate")
+                .tooltip(&format!("Snap \u{2014} {} to annotate", shortcut_label))
                 .menu(&menu)
                 .on_menu_event(|app, event| {
+                    if event.id() == "open_logs" {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+                        let log_dir = format!("{}/.snap", home);
+
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = std::process::Command::new("open").arg(&log_dir).spawn();
+                        }
+
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = std::process::Command::new("xdg-open").arg(&log_dir).spawn();
+                        }
+                        return;
+                    }
+
                     if event.id() == "quit" {
                         snap_lib::log_event("quit from tray");
                         app.exit(0);
@@ -85,11 +159,8 @@ fn run_tray_mode() {
                 })
                 .build(app)?;
 
-            // ---- Global shortcut: Ctrl+Shift+S ----
-            let shortcut = Shortcut::new(
-                Some(Modifiers::CONTROL | Modifiers::SHIFT),
-                Code::KeyS,
-            );
+            // ---- Global shortcut ----
+            let shortcut = Shortcut::new(Some(shortcut_mods), Code::KeyS);
 
             let app_handle = app.handle().clone();
 
@@ -107,30 +178,69 @@ fn run_tray_mode() {
 
                     snap_lib::log_event("hotkey triggered");
 
-                    if let Some(window) = app_handle.get_webview_window("overlay") {
-                        let _ = window.destroy();
-                    }
-
                     let handle = app_handle.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(50));
+
+                        snap_lib::capture_and_store_window_context();
+
+                        #[cfg(target_os = "macos")]
+                        {
+                            match snap_lib::capture_screen_interactive() {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    snap_lib::log_event(&format!(
+                                        "capture cancelled: {}",
+                                        e
+                                    ));
+                                    snap_lib::OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+
                         let handle_inner = handle.clone();
-                        let _ = handle.run_on_main_thread(move || {
-                            match tauri::WebviewWindowBuilder::new(
+                        let dispatch_result = handle.run_on_main_thread(move || {
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(window) = handle_inner.get_webview_window("overlay") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                    let _ = window.emit("snap://start", ());
+                                    snap_lib::log_event("overlay window reused");
+                                    return;
+                                }
+                            }
+
+                            #[cfg(not(target_os = "macos"))]
+                            if let Some(window) = handle_inner.get_webview_window("overlay") {
+                                let _ = window.destroy();
+                            }
+
+                            let mut builder = tauri::WebviewWindowBuilder::new(
                                 &handle_inner,
                                 "overlay",
                                 tauri::WebviewUrl::App("index.html".into()),
                             )
                             .title("Snap")
-                            .visible(false)
-                            .transparent(true)
                             .decorations(false)
-                            .fullscreen(true)
                             .always_on_top(true)
                             .skip_taskbar(true)
-                            .resizable(false)
-                            .build()
+                            .resizable(false);
+
+                            #[cfg(target_os = "macos")]
                             {
+                                // Keep mac startup conservative to avoid WebKit display-link
+                                // crashes observed with hidden + transparent initialization.
+                                builder = builder.visible(true).transparent(false);
+                            }
+
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                builder = builder.visible(false).transparent(true).fullscreen(true);
+                            }
+
+                            match builder.build() {
                                 Ok(_) => snap_lib::log_event("overlay window created"),
                                 Err(e) => {
                                     snap_lib::log_event(&format!(
@@ -141,21 +251,29 @@ fn run_tray_mode() {
                                 }
                             }
                         });
+
+                        if let Err(e) = dispatch_result {
+                            snap_lib::log_event(&format!(
+                                "failed to schedule overlay creation on main thread: {}",
+                                e
+                            ));
+                            snap_lib::OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
+                        }
                     });
                 },
             )?;
 
-            snap_lib::log_event("global shortcut registered: Ctrl+Shift+S");
-
-            // Destroy default window — start headless
-            if let Some(w) = app.get_webview_window("overlay") {
-                let _ = w.destroy();
-            }
-
+            snap_lib::log_event(&format!("global shortcut registered: {}", shortcut_label));
             snap_lib::log_event("snap ready — waiting for hotkey");
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running snap");
+        .build(tauri::generate_context!())
+        .expect("failed to build app")
+        .run(|_app, event| {
+            // keep alive if no windows
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }

@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import base64
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -30,7 +31,11 @@ def _log(msg: str):
         pass
 
 
-def _load_annotation(json_path: Path) -> dict:
+def _load_annotation(
+    json_path: Path,
+    include_image_data: bool = False,
+    max_image_bytes: int = 5_000_000,
+) -> dict:
     """Load a sidecar JSON and attach the image path."""
     try:
         with open(json_path) as f:
@@ -48,6 +53,20 @@ def _load_annotation(json_path: Path) -> dict:
 
     if not png_path.exists():
         data["warning"] = "image file missing"
+        return data
+
+    if include_image_data:
+        try:
+            size = png_path.stat().st_size
+            if size > max_image_bytes:
+                data["image_inline_warning"] = (
+                    f"image too large for inline payload ({size} bytes > {max_image_bytes} bytes)"
+                )
+            else:
+                data["image_base64"] = base64.b64encode(png_path.read_bytes()).decode("ascii")
+                data["image_media_type"] = "image/png"
+        except OSError as e:
+            data["image_inline_warning"] = f"failed to inline image: {e}"
 
     return data
 
@@ -114,7 +133,9 @@ def check_new_annotations() -> dict:
 
 
 @mcp.tool
-def get_latest_annotation() -> dict:
+def get_latest_annotation(
+    include_image_data: bool = True, max_image_bytes: int = 5_000_000
+) -> dict:
     """Get the most recent screen annotation. Returns the image path and
     structured metadata including annotation positions, labels, colors, and
     source window context. Claude Code should read the image at the returned
@@ -123,32 +144,43 @@ def get_latest_annotation() -> dict:
     files = _list_annotations_sorted()
     if not files:
         return {"error": "No annotations in inbox"}
-    result = _load_annotation(files[0])
+    result = _load_annotation(
+        files[0], include_image_data=include_image_data, max_image_bytes=max_image_bytes
+    )
     _mark_read()
     return result
 
 
 @mcp.tool
-def list_annotations(last_n: int = 5) -> list[dict]:
+def list_annotations(
+    last_n: int = 5, include_image_data: bool = False, max_image_bytes: int = 5_000_000
+) -> list[dict]:
     """List recent screen annotations. Returns metadata for the N most recent
     annotations, newest first. Each entry includes the image_path that Claude
     Code can read to see the annotated screenshot."""
     _log(f"list_annotations called (last_n={last_n})")
     files = _list_annotations_sorted()[:last_n]
-    results = [_load_annotation(f) for f in files]
+    results = [
+        _load_annotation(f, include_image_data=include_image_data, max_image_bytes=max_image_bytes)
+        for f in files
+    ]
     _mark_read()
     return results
 
 
 @mcp.tool
-def get_annotation(filename: str) -> dict:
+def get_annotation(
+    filename: str, include_image_data: bool = True, max_image_bytes: int = 5_000_000
+) -> dict:
     """Get a specific annotation by filename (without extension).
     Example: get_annotation('snap-20260408-142300')"""
     _log(f"get_annotation called: {filename}")
     json_path = INBOX / f"{filename}.json"
     if not json_path.exists():
         return {"error": f"Annotation '{filename}' not found"}
-    return _load_annotation(json_path)
+    return _load_annotation(
+        json_path, include_image_data=include_image_data, max_image_bytes=max_image_bytes
+    )
 
 
 @mcp.tool

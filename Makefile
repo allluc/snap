@@ -1,43 +1,99 @@
-.PHONY: build install start stop restart logs status clean dev deps setup-mcp
+.PHONY: build install start stop restart logs status clean dev deps deps-macos deps-linux setup-mcp
 
-# Install system dependencies (Ubuntu/Debian)
+OS := $(shell uname -s)
+TAURI_BUILD_ARGS :=
+
+ifeq ($(OS),Darwin)
+TAURI_BUILD_ARGS := --bundles app
+endif
+
+# Install system dependencies
 deps:
+ifeq ($(OS),Darwin)
+	$(MAKE) deps-macos
+else
+	$(MAKE) deps-linux
+endif
+
+# macOS: Xcode CLI tools provide everything; Rust via rustup
+deps-macos:
+	@command -v xcode-select >/dev/null 2>&1 || xcode-select --install
+	@command -v rustup >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+	@command -v node >/dev/null 2>&1 || (command -v brew >/dev/null 2>&1 && brew install node) || echo "Install Node.js from https://nodejs.org"
+	@echo "macOS dependencies ready."
+
+# Linux (Ubuntu/Debian)
+deps-linux:
 	sudo apt install -y scrot xdotool pkg-config libwebkit2gtk-4.1-dev \
 		build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
 build:
-	cd app && npm install && cargo tauri build
+	cd app && npm install && npx tauri build $(TAURI_BUILD_ARGS)
 	cd mcp-server && uv venv .venv && uv pip install -e .
 
 dev:
-	cd app && cargo tauri dev
+	cd app && npx tauri dev
 
 install: build
+ifeq ($(OS),Darwin)
+	$(MAKE) install-macos
+else
+	$(MAKE) install-linux
+endif
+	@echo ""
+	@echo "Snap installed and running."
+	@echo "Register with Claude Code:"
+	@echo "  claude mcp add --transport stdio snap -- $(PWD)/mcp-server/.venv/bin/python $(PWD)/mcp-server/server.py"
+
+install-macos:
+	mkdir -p ~/Library/LaunchAgents
+	sed 's|%SNAP_PATH%|$(PWD)|g; s|%HOME_PATH%|$(HOME)|g' snap.plist > ~/Library/LaunchAgents/com.adjective.snap.plist
+	launchctl unload ~/Library/LaunchAgents/com.adjective.snap.plist 2>/dev/null || true
+	launchctl load -w ~/Library/LaunchAgents/com.adjective.snap.plist
+
+install-linux:
 	mkdir -p ~/.config/systemd/user
 	cp snap.service ~/.config/systemd/user/
 	sed -i "s|%h/Desktop/snap|$(PWD)|g" ~/.config/systemd/user/snap.service
 	systemctl --user daemon-reload
 	systemctl --user enable snap.service
 	systemctl --user start snap.service
-	@echo ""
-	@echo "Snap installed and running."
-	@echo "Register with Claude Code:"
-	@echo "  claude mcp add --transport stdio snap -- $(PWD)/mcp-server/.venv/bin/python $(PWD)/mcp-server/server.py"
 
 start:
+ifeq ($(OS),Darwin)
+	launchctl load -w ~/Library/LaunchAgents/com.adjective.snap.plist
+else
 	systemctl --user start snap.service
+endif
 
 stop:
+ifeq ($(OS),Darwin)
+	launchctl unload ~/Library/LaunchAgents/com.adjective.snap.plist
+else
 	systemctl --user stop snap.service
+endif
 
 restart:
+ifeq ($(OS),Darwin)
+	launchctl unload ~/Library/LaunchAgents/com.adjective.snap.plist 2>/dev/null || true
+	launchctl load -w ~/Library/LaunchAgents/com.adjective.snap.plist
+else
 	systemctl --user restart snap.service
+endif
 
 logs:
+ifeq ($(OS),Darwin)
+	tail -f ~/.snap/snap.log
+else
 	journalctl --user -u snap.service -f
+endif
 
 status:
+ifeq ($(OS),Darwin)
+	launchctl list | grep com.adjective.snap || echo "snap not running"
+else
 	systemctl --user status snap.service
+endif
 
 setup-mcp:
 	./setup-mcp.sh

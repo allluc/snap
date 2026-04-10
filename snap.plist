@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.adjective.snap</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-g</string>
+        <string>-a</string>
+        <string>/Applications/snap.app</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>%HOME_PATH%/.snap/snap.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>%HOME_PATH%/.snap/snap.stderr.log</string>
+</dict>
+</plist>

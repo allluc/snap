@@ -8,34 +8,20 @@
     "devUrl": "http://localhost:1420"
   },
   "app": {
+    "windows": [],
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "label": "overlay",
-        "title": "Snap",
-        "visible": false,
-        "transparent": false,
-        "decorations": false,
-        "fullscreen": false,
-        "width": 1920,
-        "height": 1080,
-        "x": 0,
-        "y": 0,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "resizable": false
-      }
-    ],
+    "macOSPrivateApi": true,
     "security": {
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["/tmp/snap-*"],
+          "allow": ["/tmp/snap-*", "/private/tmp/snap-*"],
           "deny": []
         }
       },
       "csp": null
     }
   },
-  "plugins": {}
+  "plugins": {},
+  "bundle": {}
 }
